@@ -1,6 +1,9 @@
 /* This program is used to control the RobotDyn AC Light Dimmer Module.
 
-   It is meant to run on an Arduino with an ATmega328P chip (Uno, Nano, etc.).
+   It is meant to run on an Arduino with an ATmega 328P/168 chip (Uno, Nano,
+   etc.).
+
+   See LICENSE for license and copyright info.
 
    Copyright: 2020
    Author: Nick Gunderson
@@ -9,87 +12,92 @@
 #include <stdint.h>
 #include "power_lut.h"
 
-volatile bool enable_isr = false;
-volatile byte t2_scaler = 0;
+
+const byte PIN_TRIAC = 2;
+// PIN_AC_ZERO_CROSSING needs to be on either pin 2 or 3.
+const byte PIN_AC_ZERO_CROSSING = 3;
+
+// variables related to the interrupts
 volatile uint32_t t1_hit = 0;
-volatile uint32_t t2_hit = 0;
+volatile uint32_t zc_hit = 0;
 volatile unsigned long t2_start = 0;
 volatile unsigned long t1_sum = 0;
+volatile unsigned long t2_sum = 0;
+
 
 void setup()
 {
-    Serial.begin(9600);
+    // The built-in LED doesn't need to be on.
     pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+
+    pinMode(PIN_TRIAC, OUTPUT);
+    digitalWrite(PIN_TRIAC, LOW);
+
+    // There is already a Pull-up resistor on the dimmer board.
+    pinMode(PIN_AC_ZERO_CROSSING, INPUT);
+
+    Serial.begin(9600);
 
     setup_interrupts();
 
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(1000);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(1000);
+    set_power(250);
 }
 
 void loop()
 {
-    Serial.print(F("Off\n"));
+    // Uncomment this to have the dimmer loop in a low to high and back
+    // pattern.
+    //full_cycle();
+}
+
+void full_cycle()
+{
     set_power(0);
+    Serial.print(F("0 - Off\n"));
 
-    noInterrupts();
     print_hits();
-    delay(5000);
+    delay(500);
 
-    for (word i=0; i<15; i++)
+    for (word i=25; i<POWER_SAMPLES-10; i+=5)
     {
         set_power(i);
         Serial.println(i);
         print_hits();
-        delay(100);
+        delay(50);
     }
-    for (word i=15; i<POWER_SAMPLES; i++)
-    {
-        set_power(i);
-        Serial.println(i);
-        print_hits();
-        delay(40);
-    }
-    Serial.print(F("On\n"));
+    Serial.print(F("501 - On\n"));
     set_power(POWER_SAMPLES);
-    delay(5000);
-    for (word i=POWER_SAMPLES; i>15; i--)
+    delay(500);
+    for (word i=POWER_SAMPLES-6; i>30; i-=5)
     {
         set_power(i);
         Serial.println(i);
         print_hits();
-        delay(40);
-    }
-    for (word i=15; i>0; i--)
-    {
-        set_power(i);
-        Serial.println(i);
-        print_hits();
-        delay(100);
+        delay(50);
     }
 }
 
 void print_hits()
 {
     noInterrupts();
-    uint32_t t2 = t2_hit;
-    t2_hit = 0;
+    uint32_t zc = zc_hit;
+    zc_hit = 0;
     uint32_t t1 = t1_hit;
     t1_hit = 0;
     unsigned long sum = t1_sum;
     t1_sum = 0;
     interrupts();
-    Serial.print(F("T2 Hits: "));
-    Serial.println(t2);
-    Serial.print(F("T1 Hits: "));
-    Serial.println(t1);
-    Serial.print(F("Ave Time: "));
+
+    Serial.print(F("ZC:T1 Hits: "));
+    Serial.print(zc);
+    Serial.print(":");
+    Serial.print(t1);
+    Serial.print(F(" Ave Time: "));
     if (t1)
         Serial.println(sum / t1);
     else
-        Serial.print(F("NaN\n"));
+        Serial.println(F("NaN"));
 
 }
 
@@ -98,20 +106,20 @@ void set_power(uint16_t index)
     if (index == 0)
     {
         noInterrupts();
-        // disable both timer compare interrupts
+        digitalWrite(PIN_TRIAC, LOW);
+        // disable timer 1 compare interrupt and zero-c interrupt
         TIMSK1 &= ~(1 << OCIE1A);
-        TIMSK2 &= ~(1 << OCIE2A);
+        detachInterrupt(digitalPinToInterrupt(PIN_AC_ZERO_CROSSING));
         interrupts();
-        digitalWrite(LED_BUILTIN, LOW);
     }
     else if (index >= POWER_SAMPLES)
     {
         noInterrupts();
-        // disable both timer compare interrupts
+        digitalWrite(PIN_TRIAC, HIGH);
+        // disable timer 1 compare interrupt and zero-c interrupt
         TIMSK1 &= ~(1 << OCIE1A);
-        TIMSK2 &= ~(1 << OCIE2A);
+        detachInterrupt(digitalPinToInterrupt(PIN_AC_ZERO_CROSSING));
         interrupts();
-        digitalWrite(LED_BUILTIN, HIGH);
     }
     else
     {
@@ -119,34 +127,25 @@ void set_power(uint16_t index)
         noInterrupts();
         // set compare match register to correspond to the given power
         OCR1A = p;
-        // make sure the interrupt is enabled
-        // enable timer 2 compare interrupt
-        TIMSK2 |= (1 << OCIE2A);
+        // enable zero crossing interrupt
+        attachInterrupt(
+                digitalPinToInterrupt(PIN_AC_ZERO_CROSSING),
+                isr_ac_zero_crossing,
+                RISING);
         interrupts();
     }
 }
 
 void setup_interrupts()
 {
+    // See the following page for a really useful introduction to Arduino Timer
+    // interrupts. This code was based off of Amanda Ghassaei's code.
+    //
     // https://www.instructables.com/id/Arduino-Timer-Interrupts/
+    //
     // These are specific to the ATMEL 328/168 (Arduino Uno, nano, etc.).
 
     noInterrupts();   // stop interrupts
-
-    /*
-    // set timer0 interrupt at 2kHz
-    TCCR0A = 0;   // set entire TCCR0A register to 0
-    TCCR0B = 0;   // same for TCCR0B
-    TCNT0  = 0;   // initialize counter value to 0
-    // set compare match register for 2khz increments
-    OCR0A = 124;   // = (16*10^6) / (2000*64) - 1 (must be <256)
-    // turn on CTC mode
-    TCCR0A |= (1 << WGM01);
-    // Set CS01 and CS00 bits for 64 prescaler
-    TCCR0B |= (1 << CS01) | (1 << CS00);
-    // enable timer compare interrupt
-    TIMSK0 |= (1 << OCIE0A);
-    */
 
     // set timer1 interrupt at 1Hz
     TCCR1A = 0;   // set entire TCCR1A register to 0
@@ -161,53 +160,34 @@ void setup_interrupts()
     // leave timer compare interrupt disabled -- page 112
     TIMSK1 &= ~(1 << OCIE1A);
 
-    // set timer2 interrupt at 8kHz
-    TCCR2A = 0;   // set entire TCCR2A register to 0
-    TCCR2B = 0;   // same for TCCR2B
-    TCNT2  = 0;   // initialize counter value to 0
-    // set compare match register for ~1920 (1923) Hz increments
-    OCR2A = 129;   // = (16*10^6) / (1920*8) - 1 (must be <256)
-    // turn on CTC mode
-    TCCR2A |= (1 << WGM21);
-    // Set CS22 bit for 64 prescaler
-    TCCR2B |= (1 << CS22);
-    // leave timer compare interrupt disabled
-    TIMSK2 &= ~(1 << OCIE2A);
-
     interrupts();   // allow interrupts
 }
 
-/*
-ISR(TIMER0_COMPA_vect)   // Interrupt Service Routine for Timer 0.
-{
-}
-
-*/
 
 ISR(TIMER1_COMPA_vect)   // Interrupt Service Routine for Timer 1.
 {
-    digitalWrite(LED_BUILTIN, HIGH);
+    // Turn on the TRIAC
+    digitalWrite(PIN_TRIAC, HIGH);
+
     // disable timer compare interrupt
     TIMSK1 &= ~(1 << OCIE1A);
+
+    // debugging stuff
     t1_hit++;
     t1_sum += (micros() - t2_start);
 }
 
-ISR(TIMER2_COMPA_vect)   // Interrupt Service Routine for Timer 2.
+void isr_ac_zero_crossing()
 {
-    // This code needs to run at ~120 Hz: 1923 Hz / 16
-    //static unsigned byte t2_scaler = 0;
-    t2_scaler++;
-    t2_scaler &= 0xF;   // t2_scaler = t2_scaler % 16;
-    if (t2_scaler == 0)
-    {
-        // Turn off the LED and enable Timer 1
-        digitalWrite(LED_BUILTIN, LOW);
-        // clear and enable timer compare interrupt
-        TCNT1  = 0;   // initialize counter value to 0
-        TIFR1 |= (1 << OCF1A);   // manually clear the interrupt vector.
-        TIMSK1 |= (1 << OCIE1A);  // enable the interrupt.
-        t2_hit++;
-        t2_start = micros();
-    }
+    // Turn off the TRIAC
+    digitalWrite(PIN_TRIAC, LOW);
+
+    // debugging stuff
+    zc_hit++;
+    t2_start = micros();
+
+    // clear and enable timer compare interrupt
+    TCNT1  = (uint16_t) 0;   // initialize counter value to 0
+    TIFR1 |= (1 << OCF1A);   // manually clear the interrupt vector.
+    TIMSK1 |= (1 << OCIE1A);  // enable the interrupt.
 }
